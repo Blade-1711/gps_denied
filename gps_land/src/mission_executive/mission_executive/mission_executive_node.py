@@ -134,7 +134,8 @@ class MissionExecutive(Node):
         self.declare_parameter("auto_start", False)
         self.declare_parameter("waypoints_file", "")
         self.declare_parameter("return_home", True)
-        self.declare_parameter("detection_mode", "aruco")   # "aruco", "color", or "universal"
+        self.declare_parameter("detection_mode", "aruco")   # "aruco", "color", or "model"
+        self.declare_parameter("model_path", "")            # path to YOLOv8 .pt or .engine
 
         self.mission_altitude = float(self.get_parameter("mission_altitude").value)
         self.climb_velocity = float(self.get_parameter("climb_velocity").value)
@@ -142,6 +143,7 @@ class MissionExecutive(Node):
         self.return_home = bool(self.get_parameter("return_home").value)
         self.auto_start = bool(self.get_parameter("auto_start").value)
         self.detection_mode = str(self.get_parameter("detection_mode").value)
+        self.model_path = str(self.get_parameter("model_path").value)
 
         # QoS
         self.sensor_qos = QoSProfile(
@@ -205,6 +207,23 @@ class MissionExecutive(Node):
         except AttributeError:
             self.aruco_params = cv2.aruco.DetectorParameters()
 
+        # YOLO model (for detection_mode == "model")
+        self.yolo_model = None
+        if self.detection_mode == 'model':
+            if self.model_path:
+                try:
+                    from ultralytics import YOLO
+                    self.yolo_model = YOLO(self.model_path)
+                    self.get_logger().info(f"YOLOv8 model loaded: {self.model_path}")
+                except Exception as e:
+                    self.get_logger().error(f"Failed to load YOLO model '{self.model_path}': {e}")
+                    self.get_logger().error("Falling back to aruco detection")
+                    self.detection_mode = 'aruco'
+            else:
+                self.get_logger().error("detection_mode='model' but no model_path specified!")
+                self.get_logger().error("Falling back to aruco detection")
+                self.detection_mode = 'aruco'
+
         # Color detection HSV range (loaded from waypoints file if available)
         self.hsv_low = np.array([0, 100, 100])
         self.hsv_high = np.array([10, 255, 255])
@@ -251,6 +270,8 @@ class MissionExecutive(Node):
         self.get_logger().info(f"  Altitude     : {self.mission_altitude} m")
         self.get_logger().info(f"  Return Home  : {self.return_home}")
         self.get_logger().info(f"  Detection    : {self.detection_mode}")
+        if self.detection_mode == 'model':
+            self.get_logger().info(f"  Model Path   : {self.model_path}")
         self.get_logger().info(f"  Max Scan Alt : {MAX_SCAN_ALTITUDE} m")
         self.get_logger().info(f"  Exclusion R  : {EXCLUSION_RADIUS} m")
         self.get_logger().info(f"  Camera Stream: http://<jetson_ip>:5000")
@@ -331,8 +352,8 @@ class MissionExecutive(Node):
         self.precision_landing_status = msg.data
 
     def nav_image_cb(self, msg):
-        """Marker detection during NAVIGATE, SEARCH_HOVER, and SEARCH_CLIMB states."""
-        if self.state not in (STATE_NAVIGATE, STATE_SEARCH_HOVER, STATE_SEARCH_CLIMB):
+        """Marker detection during NAVIGATE and SEARCH_HOVER states."""
+        if self.state not in (STATE_NAVIGATE, STATE_SEARCH_HOVER):
             return
         try:
             frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
@@ -397,93 +418,23 @@ class MissionExecutive(Node):
             return None
         return (M["m10"] / M["m00"], M["m01"] / M["m00"], area)
 
-    def _detect_universal(self, frame):
-        """
-        Universal marker detection for green football field.
-
-        Algorithm:
-            1. Suppress green-dominant pixels (grass) using green channel ratio
-            2. Find remaining non-green blobs (the marker board/paper)
-            3. Score each blob by symmetry (H-flip + V-flip similarity)
-            4. Return centroid of highest-scoring symmetric blob
-        """
-        h, w = frame.shape[:2]
-        frame_area = h * w
-
-        # Step 1: Green suppression
-        b, g, r = cv2.split(frame.astype(np.float32) + 1.0)
-        green_ratio = g / (r + g + b)
-        non_green_mask = (green_ratio < 0.38).astype(np.uint8) * 255
-
-        # Step 2: Clean mask
-        kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        kernel_large = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-        non_green_mask = cv2.morphologyEx(non_green_mask, cv2.MORPH_OPEN, kernel_small)
-        non_green_mask = cv2.morphologyEx(non_green_mask, cv2.MORPH_CLOSE, kernel_large)
-
-        # Step 3: Find contours
-        contours, _ = cv2.findContours(non_green_mask, cv2.RETR_EXTERNAL,
-                                       cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
+    def _detect_model(self, frame):
+        """Detect marker using YOLOv8 model inference."""
+        if self.yolo_model is None:
             return None
-
-        # Step 4: Score by symmetry + geometry
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        best = None
-        best_score = 0.0
-
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area < frame_area * 0.003 or area > frame_area * 0.6:
-                continue
-
-            perimeter = cv2.arcLength(cnt, True)
-            if perimeter == 0:
-                continue
-
-            x, y, bw, bh = cv2.boundingRect(cnt)
-
-            # Symmetry scoring
-            symmetry = 0.0
-            if bw >= 16 and bh >= 16:
-                roi = gray[y:y+bh, x:x+bw]
-                roi_resized = cv2.resize(roi, (64, 64))
-
-                flipped_h = cv2.flip(roi_resized, 1)
-                diff_h = cv2.absdiff(roi_resized, flipped_h)
-                sym_h = 1.0 - (float(np.mean(diff_h)) / 255.0)
-
-                flipped_v = cv2.flip(roi_resized, 0)
-                diff_v = cv2.absdiff(roi_resized, flipped_v)
-                sym_v = 1.0 - (float(np.mean(diff_v)) / 255.0)
-
-                symmetry = (sym_h + sym_v) / 2.0
-
-            # Reject if not symmetric enough
-            if symmetry < 0.65:
-                continue
-
-            # Geometric scoring
-            circularity = 4.0 * math.pi * area / (perimeter * perimeter)
-            aspect = min(bw, bh) / max(bw, bh) if max(bw, bh) > 0 else 0.0
-            hull_area = cv2.contourArea(cv2.convexHull(cnt))
-            solidity = area / hull_area if hull_area > 0 else 0.0
-
-            # Combined score
-            score = (
-                symmetry * 4.0 +
-                circularity * 1.0 +
-                aspect * 1.0 +
-                solidity * 0.5
-            ) * math.sqrt(area / frame_area)
-
-            if score > best_score:
-                best_score = score
-                M = cv2.moments(cnt)
-                if M["m00"] > 0:
-                    best = (M["m10"] / M["m00"], M["m01"] / M["m00"], area)
-
-        return best
+        try:
+            results = self.yolo_model.predict(frame, conf=0.5, verbose=False)
+            if results and len(results[0].boxes) > 0:
+                boxes = results[0].boxes
+                best_idx = boxes.conf.argmax()
+                x1, y1, x2, y2 = boxes.xyxy[best_idx].cpu().numpy()
+                cx = (x1 + x2) / 2.0
+                cy = (y1 + y2) / 2.0
+                area = (x2 - x1) * (y2 - y1)
+                return (float(cx), float(cy), float(area))
+        except Exception:
+            pass
+        return None
 
     def _detect_marker(self, frame):
         """General marker detection dispatcher based on detection_mode."""
@@ -491,8 +442,8 @@ class MissionExecutive(Node):
             return self._detect_aruco(frame)
         elif self.detection_mode == 'color':
             return self._detect_color(frame)
-        elif self.detection_mode == 'universal':
-            return self._detect_universal(frame)
+        elif self.detection_mode == 'model':
+            return self._detect_model(frame)
         return self._detect_aruco(frame)
 
     def _estimate_marker_enu(self, cx, cy):
@@ -548,6 +499,18 @@ class MissionExecutive(Node):
             if self.detection_mode == 'aruco' and file_mode != 'aruco':
                 self.detection_mode = file_mode
                 self.get_logger().info(f"Detection mode from file: {self.detection_mode}")
+        if "model_path" in data and data["model_path"]:
+            if not self.model_path:
+                self.model_path = str(data["model_path"])
+                # Load model now if needed
+                if self.detection_mode == 'model' and self.yolo_model is None:
+                    try:
+                        from ultralytics import YOLO
+                        self.yolo_model = YOLO(self.model_path)
+                        self.get_logger().info(f"YOLOv8 model loaded from file config: {self.model_path}")
+                    except Exception as e:
+                        self.get_logger().error(f"Failed to load YOLO model: {e}")
+                        self.detection_mode = 'aruco'
         if "color_hsv_low" in data:
             self.hsv_low = np.array(data["color_hsv_low"], dtype=np.uint8)
         if "color_hsv_high" in data:

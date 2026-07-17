@@ -21,7 +21,8 @@ Output:
     {
       "num_waypoints": 3,
       "default_altitude": 3.0,
-      "detection_mode": "universal",
+      "detection_mode": "model",
+      "model_path": "/home/TerraWings/models/marker.pt",
       "color_hsv_low": [0, 100, 100],
       "color_hsv_high": [10, 255, 255],
       "waypoints": [
@@ -85,6 +86,7 @@ class GpsToLocal(Node):
 
         # Detection config
         self.detection_mode = "aruco"
+        self.model_path = ""
         self.color_hsv_low = [0, 100, 100]
         self.color_hsv_high = [10, 255, 255]
 
@@ -220,9 +222,9 @@ class GpsToLocal(Node):
         print("============================================")
         print("")
         print("  Detection modes:")
-        print("    1. aruco     — ArUco marker (DICT_4X4_250)")
-        print("    2. color     — Color blob (HSV range)")
-        print("    3. universal — Any marker on green field (auto-detect)")
+        print("    1. aruco  — ArUco marker (DICT_4X4_250)")
+        print("    2. color  — Color blob (HSV range)")
+        print("    3. model  — YOLOv8 trained model (.pt or .engine)")
         print("")
 
         while True:
@@ -233,11 +235,11 @@ class GpsToLocal(Node):
             elif mode_input == "2" or mode_input == "color":
                 self.detection_mode = "color"
                 break
-            elif mode_input == "3" or mode_input == "universal":
-                self.detection_mode = "universal"
+            elif mode_input == "3" or mode_input == "model":
+                self.detection_mode = "model"
                 break
             else:
-                print("  Enter: aruco, color, or universal (or 1/2/3)")
+                print("  Enter: aruco, color, or model (or 1/2/3)")
 
         # Color-specific config
         if self.detection_mode == "color":
@@ -267,13 +269,24 @@ class GpsToLocal(Node):
                 except ValueError:
                     print("  Enter integers only.")
 
+        # Model-specific config
+        elif self.detection_mode == "model":
+            print("")
+            while True:
+                model_input = input("  Model file path (.pt or .engine): ").strip()
+                if model_input:
+                    self.model_path = model_input
+                    break
+                else:
+                    print("  Path cannot be empty.")
+
         print("")
         print(f"  ✓ Detection: {self.detection_mode}")
-        if self.detection_mode == "color":
+        if self.detection_mode == "model":
+            print(f"    Model: {self.model_path}")
+        elif self.detection_mode == "color":
             print(f"    HSV low:  {self.color_hsv_low}")
             print(f"    HSV high: {self.color_hsv_high}")
-        elif self.detection_mode == "universal":
-            print(f"    Green suppression + symmetry scoring (no config needed)")
         print("============================================")
 
     # ==========================================================
@@ -299,6 +312,7 @@ class GpsToLocal(Node):
             "home_lat": self.home_lat,
             "home_lon": self.home_lon,
             "detection_mode": self.detection_mode,
+            "model_path": self.model_path,
             "color_hsv_low": self.color_hsv_low,
             "color_hsv_high": self.color_hsv_high,
             "waypoints": self.waypoints,
@@ -318,7 +332,9 @@ class GpsToLocal(Node):
         self.get_logger().info(f" Home GPS   : ({self.home_lat:.6f}, {self.home_lon:.6f})")
         self.get_logger().info(f" Waypoints  : {self.num_waypoints} (+ home)")
         self.get_logger().info(f" Detection  : {self.detection_mode}")
-        if self.detection_mode == "color":
+        if self.detection_mode == "model":
+            self.get_logger().info(f" Model      : {self.model_path}")
+        elif self.detection_mode == "color":
             self.get_logger().info(f" HSV Low    : {self.color_hsv_low}")
             self.get_logger().info(f" HSV High   : {self.color_hsv_high}")
         self.get_logger().info("----------------------------------------")

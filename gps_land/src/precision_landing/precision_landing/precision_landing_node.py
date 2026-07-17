@@ -37,7 +37,8 @@ Parameters:
     align_tolerance : normalized tolerance for "centered" (default 0.05)
     max_align_speed : max horizontal correction m/s (default 0.3)
     kp_align        : P-gain for alignment (default 0.15)
-    detection_mode  : "aruco", "color", or "universal" (default "aruco")
+    detection_mode  : "aruco", "color", or "model" (default "aruco")
+    model_path      : path to YOLOv8 model file (.pt or .engine) for "model" mode
     color_h_low/high, color_s_low/high, color_v_low/high : HSV range for color
 """
 
@@ -57,6 +58,55 @@ from mavros_msgs.msg import State, PositionTarget
 from std_msgs.msg import String, Bool
 from mavros_msgs.srv import CommandLong
 from cv_bridge import CvBridge
+
+import threading
+import socket
+from flask import Flask, Response, render_template_string
+
+# ==========================================================
+# Web UI (MJPEG stream — access from laptop over SSH/WiFi)
+# ==========================================================
+WEB_PORT = 5000
+_web_frame = None
+_web_frame_lock = threading.Lock()
+
+_flask_app = Flask(__name__)
+
+_WEB_PAGE = """<!DOCTYPE html><html><head><title>Precision Landing</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>body{background:#111;color:#eee;font-family:monospace;text-align:center;padding:10px}
+img{width:100%;max-width:720px;border:2px solid #0cf;border-radius:8px}
+h2{color:#0cf}</style></head><body>
+<h2>&#128681; Precision Landing — Live Feed</h2>
+<img src="/video_feed"><br>
+<p style="color:#888">Green = marker detected | Red = not found | White crosshair = center target</p>
+</body></html>"""
+
+@_flask_app.route('/')
+def _index():
+    return render_template_string(_WEB_PAGE)
+
+@_flask_app.route('/video_feed')
+def _video_feed():
+    return Response(_gen_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+def _gen_frames():
+    while True:
+        with _web_frame_lock:
+            f = _web_frame
+        if f is None:
+            placeholder = np.zeros((480, 640, 3), dtype=np.uint8)
+            cv2.putText(placeholder, 'Waiting for camera...', (150, 240),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2)
+            _, jpg = cv2.imencode('.jpg', placeholder)
+        else:
+            _, jpg = cv2.imencode('.jpg', f, [cv2.IMWRITE_JPEG_QUALITY, 75])
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + jpg.tobytes() + b'\r\n')
+        time.sleep(0.033)
+
+def _start_web():
+    _flask_app.run(host='0.0.0.0', port=WEB_PORT, threaded=True, use_reloader=False)
 
 
 # ==========================================================
@@ -125,7 +175,8 @@ class PrecisionLanding(Node):
         self.declare_parameter('align_tolerance', 0.05)
         self.declare_parameter('max_align_speed', 0.15)
         self.declare_parameter('kp_align', 0.15)
-        self.declare_parameter('detection_mode', 'aruco')   # "aruco", "color", or "universal"
+        self.declare_parameter('detection_mode', 'aruco')   # "aruco", "color", or "model"
+        self.declare_parameter('model_path', '')             # path to YOLOv8 .pt or .engine
         self.declare_parameter('camera_topic', '/down/image_raw')
         self.declare_parameter('color_h_low', 0)
         self.declare_parameter('color_h_high', 10)
@@ -141,6 +192,7 @@ class PrecisionLanding(Node):
         self.max_align_speed = self.get_parameter('max_align_speed').value
         self.kp_align = self.get_parameter('kp_align').value
         self.detection_mode = self.get_parameter('detection_mode').value
+        self.model_path = self.get_parameter('model_path').value
         self.camera_topic = self.get_parameter('camera_topic').value
 
         self.hsv_low = np.array([
@@ -151,6 +203,23 @@ class PrecisionLanding(Node):
             self.get_parameter('color_h_high').value,
             self.get_parameter('color_s_high').value,
             self.get_parameter('color_v_high').value])
+
+        # Load YOLO model if detection_mode is "model"
+        self.yolo_model = None
+        if self.detection_mode == 'model':
+            if self.model_path:
+                try:
+                    from ultralytics import YOLO
+                    self.yolo_model = YOLO(self.model_path)
+                    self.get_logger().info(f"YOLOv8 model loaded: {self.model_path}")
+                except Exception as e:
+                    self.get_logger().error(f"Failed to load YOLO model '{self.model_path}': {e}")
+                    self.get_logger().error("Falling back to aruco detection")
+                    self.detection_mode = 'aruco'
+            else:
+                self.get_logger().error("detection_mode='model' but no model_path specified!")
+                self.get_logger().error("Falling back to aruco detection")
+                self.detection_mode = 'aruco'
 
         # State
         self.state = ST_IDLE
@@ -224,6 +293,17 @@ class PrecisionLanding(Node):
         # Timer
         self.create_timer(1.0 / CONTROL_RATE, self.control_loop)
 
+        # Web UI (MJPEG stream on port 5000)
+        threading.Thread(target=_start_web, daemon=True).start()
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(('8.8.8.8', 80))
+            local_ip = s.getsockname()[0]
+            s.close()
+        except Exception:
+            local_ip = '127.0.0.1'
+        self.get_logger().info(f"  Web UI: http://{local_ip}:{WEB_PORT}")
+
         # File logging
         import os
         from datetime import datetime
@@ -243,6 +323,8 @@ class PrecisionLanding(Node):
         self.get_logger().info(f"  Altitude ref  : {self.target_alt} m")
         self.get_logger().info(f"  Marker ID     : {self.marker_id} (-1=any)")
         self.get_logger().info(f"  Detection     : {self.detection_mode}")
+        if self.detection_mode == 'model':
+            self.get_logger().info(f"  Model path    : {self.model_path}")
         self.get_logger().info(f"  Align tol     : {self.align_tolerance}")
         self.get_logger().info(f"  Camera        : {self.camera_topic}")
         self.get_logger().info(f"  Log file      : {self.log_file_path}")
@@ -308,8 +390,8 @@ class PrecisionLanding(Node):
             detection = self._detect_aruco(frame)
         elif self.detection_mode == 'color':
             detection = self._detect_color(frame)
-        elif self.detection_mode == 'universal':
-            detection = self._detect_universal(frame)
+        elif self.detection_mode == 'model':
+            detection = self._detect_model(frame)
 
         if detection is not None:
             self.marker_cx, self.marker_cy, _ = detection
@@ -357,108 +439,27 @@ class PrecisionLanding(Node):
             return None
         return (M["m10"] / M["m00"], M["m01"] / M["m00"], area)
 
-    def _detect_universal(self, frame):
-        """
-        Universal marker detection for green football field.
-
-        Algorithm:
-            1. Suppress green-dominant pixels (grass) using green channel ratio
-            2. Find remaining non-green blobs (the marker board/paper)
-            3. Score each blob by symmetry (H-flip + V-flip similarity)
-            4. Return centroid of highest-scoring symmetric blob
-
-        Works for any marker type on any colored board placed on green grass.
-        """
-        h, w = frame.shape[:2]
-        frame_area = h * w
-
-        # Step 1: Green suppression — compute green ratio per pixel
-        b, g, r = cv2.split(frame.astype(np.float32) + 1.0)  # +1 avoids div-by-zero
-        green_ratio = g / (r + g + b)
-
-        # Pixels with green_ratio > 0.38 are grass → suppress
-        non_green_mask = (green_ratio < 0.38).astype(np.uint8) * 255
-
-        # Step 2: Clean the mask (remove small noise, fill gaps in board)
-        kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        kernel_large = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-        non_green_mask = cv2.morphologyEx(non_green_mask, cv2.MORPH_OPEN, kernel_small)
-        non_green_mask = cv2.morphologyEx(non_green_mask, cv2.MORPH_CLOSE, kernel_large)
-
-        # Step 3: Find contours of non-green regions
-        contours, _ = cv2.findContours(non_green_mask, cv2.RETR_EXTERNAL,
-                                       cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
+    def _detect_model(self, frame):
+        """Detect marker using YOLOv8 model inference."""
+        if self.yolo_model is None:
             return None
-
-        # Step 4: Score each candidate by symmetry + geometry
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        best = None
-        best_score = 0.0
-
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-
-            # Size filter: ignore noise (too small) and ground (too large)
-            if area < frame_area * 0.003 or area > frame_area * 0.6:
-                continue
-
-            perimeter = cv2.arcLength(cnt, True)
-            if perimeter == 0:
-                continue
-
-            x, y, bw, bh = cv2.boundingRect(cnt)
-
-            # --- Symmetry scoring (the key discriminator) ---
-            symmetry = 0.0
-            if bw >= 16 and bh >= 16:
-                roi = gray[y:y+bh, x:x+bw]
-                roi_resized = cv2.resize(roi, (64, 64))
-
-                # Horizontal symmetry
-                flipped_h = cv2.flip(roi_resized, 1)
-                diff_h = cv2.absdiff(roi_resized, flipped_h)
-                sym_h = 1.0 - (float(np.mean(diff_h)) / 255.0)
-
-                # Vertical symmetry
-                flipped_v = cv2.flip(roi_resized, 0)
-                diff_v = cv2.absdiff(roi_resized, flipped_v)
-                sym_v = 1.0 - (float(np.mean(diff_v)) / 255.0)
-
-                symmetry = (sym_h + sym_v) / 2.0
-
-            # Reject if not symmetric enough — markers are always symmetric
-            if symmetry < 0.65:
-                continue
-
-            # --- Geometric scoring ---
-            # Circularity (compact shapes score higher)
-            circularity = 4.0 * math.pi * area / (perimeter * perimeter)
-
-            # Aspect ratio (markers are roughly square or circular)
-            aspect = min(bw, bh) / max(bw, bh) if max(bw, bh) > 0 else 0.0
-
-            # Solidity (filled ratio vs convex hull)
-            hull_area = cv2.contourArea(cv2.convexHull(cnt))
-            solidity = area / hull_area if hull_area > 0 else 0.0
-
-            # --- Combined score ---
-            score = (
-                symmetry * 4.0 +         # Symmetry is dominant cue
-                circularity * 1.0 +      # Compact shape
-                aspect * 1.0 +           # Square-ish
-                solidity * 0.5           # Filled (not hollow)
-            ) * math.sqrt(area / frame_area)  # Prefer larger detections
-
-            if score > best_score:
-                best_score = score
-                M = cv2.moments(cnt)
-                if M["m00"] > 0:
-                    best = (M["m10"] / M["m00"], M["m01"] / M["m00"], area)
-
-        return best
+        try:
+            results = self.yolo_model.predict(frame, conf=0.5, verbose=False)
+            if results and len(results[0].boxes) > 0:
+                # Take the highest confidence detection
+                boxes = results[0].boxes
+                best_idx = boxes.conf.argmax()
+                x1, y1, x2, y2 = boxes.xyxy[best_idx].cpu().numpy()
+                cx = (x1 + x2) / 2.0
+                cy = (y1 + y2) / 2.0
+                area = (x2 - x1) * (y2 - y1)
+                return (float(cx), float(cy), float(area))
+        except Exception as e:
+            self.get_logger().warn(f"YOLO inference error: {e}", throttle_duration_sec=5.0)
+        return None
 
     def _publish_debug(self, frame):
+        global _web_frame
         h, w = frame.shape[:2]
         color = (0, 255, 0) if self.marker_found else (0, 0, 255)
 
@@ -477,6 +478,10 @@ class PrecisionLanding(Node):
             conf_color = (0, 255, 0) if self.align_confidence > 90 else (0, 255, 255) if self.align_confidence > 50 else (0, 0, 255)
             cv2.putText(frame, f"Confidence: {self.align_confidence:.0f}%",
                         (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, conf_color, 2)
+
+        # Feed web UI
+        with _web_frame_lock:
+            _web_frame = frame.copy()
 
         try:
             self.debug_pub.publish(self.bridge.cv2_to_imgmsg(frame, encoding='bgr8'))

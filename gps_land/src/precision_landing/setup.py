@@ -24,7 +24,6 @@ setup(
         'console_scripts': [
             'precision_landing_node = precision_landing.precision_landing_node:main',
             'camera_publisher = precision_landing.camera_publisher:main',
-            'camera_stream = precision_landing.camera_stream:main',
         ],
     },
 )

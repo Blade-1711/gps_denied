@@ -227,9 +227,6 @@ class MissionExecutive(Node):
         # Color detection HSV range (loaded from waypoints file if available)
         self.hsv_low = np.array([0, 100, 100])
         self.hsv_high = np.array([10, 255, 255])
-        # Second color (print) — default: black
-        self.hsv_low2 = np.array([0, 0, 0])
-        self.hsv_high2 = np.array([180, 255, 75])
 
         # Timing
         self.last_log_time = self.get_clock().now()
@@ -403,116 +400,23 @@ class MissionExecutive(Node):
         return (cx, cy, area)
 
     def _detect_color(self, frame):
-        """
-        Dual-color marker detection.
-
-        Uses board_color (hsv_low/hsv_high) + print_color (hsv_low2/hsv_high2).
-        Finds blobs where BOTH colors are together, with high internal contrast
-        and symmetry. Rejects walls/floors (low contrast, span entire frame).
-        """
-        h, w = frame.shape[:2]
-        frame_area = h * w
+        """Detect marker using HSV color filtering."""
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-        # Get masks for both colors
-        board_mask = cv2.inRange(hsv, self.hsv_low, self.hsv_high)
-        print_mask = cv2.inRange(hsv, self.hsv_low2, self.hsv_high2)
-
-        # Combine both colors
-        combined = cv2.bitwise_or(board_mask, print_mask)
-
-        # Morphological cleanup
-        kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-        combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN, kernel_open)
-        combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel_close)
-
-        # Find contours
-        contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL,
-                                       cv2.CHAIN_APPROX_SIMPLE)
+        mask = cv2.inRange(hsv, self.hsv_low, self.hsv_high)
+        kernel = np.ones((5, 5), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
             return None
-
-        best = None
-        best_score = 0.0
-
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-
-            # Size: 0.5% to 40% of frame
-            if area < frame_area * 0.005 or area > frame_area * 0.40:
-                continue
-
-            perimeter = cv2.arcLength(cnt, True)
-            if perimeter == 0:
-                continue
-
-            x, y, bw, bh = cv2.boundingRect(cnt)
-
-            # Reject if spans >80% of frame width or height (wall/floor)
-            if bw > w * 0.80 or bh > h * 0.80:
-                continue
-
-            # Both colors must be present inside this blob
-            roi_mask = np.zeros((h, w), dtype=np.uint8)
-            cv2.drawContours(roi_mask, [cnt], -1, 255, -1)
-
-            board_inside = cv2.bitwise_and(board_mask, board_mask, mask=roi_mask)
-            print_inside = cv2.bitwise_and(print_mask, print_mask, mask=roi_mask)
-
-            board_pixels = np.count_nonzero(board_inside)
-            print_pixels = np.count_nonzero(print_inside)
-            total_pixels = np.count_nonzero(roi_mask)
-
-            if total_pixels == 0:
-                continue
-
-            board_ratio = board_pixels / total_pixels
-            print_ratio = print_pixels / total_pixels
-
-            # Both colors must be meaningfully present (>=8%)
-            if board_ratio < 0.08 or print_ratio < 0.08:
-                continue
-
-            # Internal contrast: markers have high std dev, walls don't
-            roi_gray = gray[y:y+bh, x:x+bw]
-            roi_std = float(np.std(roi_gray))
-            if roi_std < 35:
-                continue
-
-            # Symmetry check
-            symmetry = 0.0
-            if bw >= 20 and bh >= 20:
-                roi_resized = cv2.resize(roi_gray, (64, 64))
-                flipped_h = cv2.flip(roi_resized, 1)
-                sym_h = 1.0 - (float(np.mean(cv2.absdiff(roi_resized, flipped_h))) / 255.0)
-                flipped_v = cv2.flip(roi_resized, 0)
-                sym_v = 1.0 - (float(np.mean(cv2.absdiff(roi_resized, flipped_v))) / 255.0)
-                symmetry = (sym_h + sym_v) / 2.0
-
-            if symmetry < 0.50:
-                continue
-
-            # Geometric scoring
-            circularity = 4.0 * math.pi * area / (perimeter * perimeter)
-            aspect = min(bw, bh) / max(bw, bh) if max(bw, bh) > 0 else 0.0
-
-            score = (
-                symmetry * 3.0 +
-                (roi_std / 100.0) * 2.0 +
-                circularity * 1.0 +
-                aspect * 1.5 +
-                min(board_ratio, print_ratio) * 2.0
-            ) * math.sqrt(area / frame_area)
-
-            if score > best_score:
-                best_score = score
-                M = cv2.moments(cnt)
-                if M["m00"] > 0:
-                    best = (M["m10"] / M["m00"], M["m01"] / M["m00"], area)
-
-        return best
+        largest = max(contours, key=cv2.contourArea)
+        area = cv2.contourArea(largest)
+        if area < 200:
+            return None
+        M = cv2.moments(largest)
+        if M["m00"] == 0:
+            return None
+        return (M["m10"] / M["m00"], M["m01"] / M["m00"], area)
 
     def _detect_model(self, frame):
         """Detect marker using YOLOv8 model inference."""
@@ -611,10 +515,6 @@ class MissionExecutive(Node):
             self.hsv_low = np.array(data["color_hsv_low"], dtype=np.uint8)
         if "color_hsv_high" in data:
             self.hsv_high = np.array(data["color_hsv_high"], dtype=np.uint8)
-        if "color2_hsv_low" in data:
-            self.hsv_low2 = np.array(data["color2_hsv_low"], dtype=np.uint8)
-        if "color2_hsv_high" in data:
-            self.hsv_high2 = np.array(data["color2_hsv_high"], dtype=np.uint8)
 
     def compute_leg_target(self):
         """

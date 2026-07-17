@@ -97,10 +97,6 @@ def generate_launch_description():
         package='precision_landing', executable='camera_publisher',
         name='camera_publisher', output='screen')
 
-    camera_stream = Node(
-        package='precision_landing', executable='camera_stream',
-        name='camera_stream', output='screen')
-
     precision_landing_node = Node(
         package='precision_landing', executable='precision_landing_node',
         name='precision_landing', output='screen',
@@ -132,7 +128,7 @@ def generate_launch_description():
     delayed_nodes = TimerAction(
         period=5.0,
         actions=[state_bridge, guidance, command_bridge,
-                 camera_publisher, camera_stream, precision_landing_node, mission_exec],
+                 camera_publisher, precision_landing_node, mission_exec],
     )
 
     return LaunchDescription([

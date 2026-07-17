@@ -89,8 +89,6 @@ class GpsToLocal(Node):
         self.model_path = ""
         self.color_hsv_low = [0, 100, 100]
         self.color_hsv_high = [10, 255, 255]
-        self.color2_hsv_low = [0, 0, 0]
-        self.color2_hsv_high = [180, 255, 75]
 
         # --------------------------------------------------
         # Collect input + write file
@@ -246,54 +244,30 @@ class GpsToLocal(Node):
         # Color-specific config
         if self.detection_mode == "color":
             print("")
-            print("  Dual-color detection: board color + print color")
-            print("  (Finds the board, confirms print inside, checks symmetry)")
-            print("")
-            print("  Preset colors:")
-            print("    white  — H:0-180 S:0-50  V:170-255")
-            print("    black  — H:0-180 S:0-255 V:0-75")
-            print("    red    — H:0-12  S:70-255 V:50-255")
-            print("    blue   — H:95-135 S:70-255 V:40-255")
-            print("    yellow — H:18-38 S:70-255 V:60-255")
+            print("  Enter HSV range for the marker color.")
+            print("  (Use a color picker tool to find values)")
+            print("  Format: H_low H_high S_low S_high V_low V_high")
+            print("  Example for red: 0 10 100 255 100 255")
             print("")
 
-            presets = {
-                "white":  ([0, 0, 170], [180, 50, 255]),
-                "black":  ([0, 0, 0], [180, 255, 75]),
-                "red":    ([0, 70, 50], [12, 255, 255]),
-                "blue":   ([95, 70, 40], [135, 255, 255]),
-                "yellow": ([18, 70, 60], [38, 255, 255]),
-                "green":  ([35, 70, 40], [85, 255, 255]),
-                "orange": ([8, 70, 70], [18, 255, 255]),
-                "grey":   ([0, 0, 60], [180, 45, 180]),
-            }
-
-            # Board color
             while True:
-                board_input = input("  Board color [white]: ").strip().lower()
-                if board_input == "":
-                    board_input = "white"
-                if board_input in presets:
-                    low, high = presets[board_input]
-                    self.color_hsv_low = low
-                    self.color_hsv_high = high
-                    break
-                print(f"  Options: {', '.join(presets.keys())}")
-
-            # Print color
-            while True:
-                print_input = input("  Print color [black]: ").strip().lower()
-                if print_input == "":
-                    print_input = "black"
-                if print_input in presets:
-                    low, high = presets[print_input]
-                    self.color2_hsv_low = low
-                    self.color2_hsv_high = high
-                    break
-                print(f"  Options: {', '.join(presets.keys())}")
-
-            print(f"    Board: {board_input} → HSV {self.color_hsv_low} to {self.color_hsv_high}")
-            print(f"    Print: {print_input} → HSV {self.color2_hsv_low} to {self.color2_hsv_high}")
+                try:
+                    hsv_input = input("  HSV range [0 10 100 255 100 255]: ").strip()
+                    if hsv_input == "":
+                        # Default red
+                        self.color_hsv_low = [0, 100, 100]
+                        self.color_hsv_high = [10, 255, 255]
+                        break
+                    parts = hsv_input.split()
+                    if len(parts) == 6:
+                        h_lo, h_hi, s_lo, s_hi, v_lo, v_hi = [int(p) for p in parts]
+                        self.color_hsv_low = [h_lo, s_lo, v_lo]
+                        self.color_hsv_high = [h_hi, s_hi, v_hi]
+                        break
+                    else:
+                        print("  Need 6 values: H_low H_high S_low S_high V_low V_high")
+                except ValueError:
+                    print("  Enter integers only.")
 
         # Model-specific config
         elif self.detection_mode == "model":
@@ -341,8 +315,6 @@ class GpsToLocal(Node):
             "model_path": self.model_path,
             "color_hsv_low": self.color_hsv_low,
             "color_hsv_high": self.color_hsv_high,
-            "color2_hsv_low": self.color2_hsv_low,
-            "color2_hsv_high": self.color2_hsv_high,
             "waypoints": self.waypoints,
             "segment_altitudes": self.segment_altitudes,
         }
