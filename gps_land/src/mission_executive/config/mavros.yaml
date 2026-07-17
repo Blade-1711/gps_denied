@@ -1,0 +1,21 @@
+# MAVROS2 config for GPS-denied flight with Holybro H-Flow
+# Distance sensor mapping for H-Flow rangefinder
+
+/**:
+  ros__parameters:
+    fcu_protocol: "v2.0"
+    system_id: 255
+    component_id: 240
+    tgt_system: 1
+    tgt_component: 1
+
+/**/distance_sensor:
+  ros__parameters:
+    config: |
+      rangefinder_pub:
+        id: 0
+        frame_id: "rangefinder"
+        orientation: PITCH_270
+        field_of_view: 0.05
+        send_tf: false
+        sensor_position: {x: 0.0, y: 0.0, z: -0.05}
